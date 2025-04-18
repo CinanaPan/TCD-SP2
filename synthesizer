@@ -1,0 +1,264 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import lfilter, freqz, butter, find_peaks
+from scipy.io.wavfile import write
+
+# 采样参数
+Fs = 10000  # 10 kHz采样率
+duration = 0.5  # 持续时间
+
+# Klatt (1980) 男性元音共振峰数据（前5个共振峰）
+formant_data = {
+    'a': [(730, 80), (1090, 90), (2440, 120), (3500, 200), (4950, 300)],
+    'i': [(270, 60), (2290, 90), (3010, 100), (3400, 200), (4950, 300)],
+    'u': [(300, 70), (870, 80), (2240, 100), (3200, 200), (4950, 300)]
+}
+
+# 生成脉冲源（带低通滤波）
+def generate_impulse_train(f0=100, duration=duration, fs=Fs):
+    num_samples = int(duration * fs)
+    impulse_train = np.zeros(num_samples)
+    period = fs // f0
+    impulse_train[::period] = 1  # 脉冲序列
+    
+    # 一阶Butterworth低通滤波器（模拟声门波）
+    b, a = butter(1, f0/(fs/2), btype='low')
+    return lfilter(b, a, impulse_train)
+
+# 级联合成器（5个共振峰串联）
+def cascade_synth(vowel, impulse_train, fs=Fs):
+    y = impulse_train.copy()
+    # 遍历所有5个共振峰
+    for f, bw in formant_data[vowel]:
+        omega = 2 * np.pi * f / fs
+        r = np.exp(-np.pi * bw / fs)
+        a_coeff = [1, -2*r*np.cos(omega), r**2]
+        y = lfilter([1], a_coeff, y)  # 串联滤波
+    return y
+
+# 计算级联系统的共振峰增益（用于并联校准）
+def calculate_formant_gains(vowel, fs=Fs):
+    w, h = np.zeros(1024), np.ones(1024, dtype=complex)
+    # 计算级联系统总响应
+    for f, bw in formant_data[vowel]:
+        omega = 2 * np.pi * f / fs
+        r = np.exp(-np.pi * bw / fs)
+        _, h_res = freqz([1], [1, -2*r*np.cos(omega), r**2], worN=1024, fs=fs)
+        h *= h_res
+    # 提取前3个共振峰增益
+    freqs = np.linspace(0, fs/2, 1024)
+    gains = []
+    for i in range(3):
+        target_f = formant_data[vowel][i][0]
+        idx = np.argmin(np.abs(freqs - target_f))
+        gains.append(np.abs(h[idx]))
+    return gains
+
+# 并联合成器（3个共振峰并联）
+def parallel_synth(vowel, impulse_train, fs=Fs):
+    y = np.zeros_like(impulse_train)
+    gains = calculate_formant_gains(vowel, fs)
+    
+    for i, (f, bw) in enumerate(formant_data[vowel][:3]):  # 仅前3个共振峰
+        sign = (-1) ** i  # 极性交替
+        
+        # F1处理：预加重 + 全通
+        if i == 0:
+            # 预加重滤波器（640Hz零点）
+            b_pre = [1, -np.exp(-2 * np.pi * 640 / fs)]
+            a_pre = [1, 0]
+            filtered = lfilter(b_pre, a_pre, impulse_train)
+            
+            # 全通滤波器（270Hz极零点）
+            theta = 2 * np.pi * 270 / fs
+            b_allpass = [1 - np.tan(theta/2), 1 + np.tan(theta/2)]
+            a_allpass = [1 + np.tan(theta/2), 1 - np.tan(theta/2)]
+            filtered = lfilter(b_allpass, a_allpass, filtered)
+        else:  # F2/F3处理：微分器
+            b_diff = [1, -1]
+            a_diff = [1, 0]
+            filtered = lfilter(b_diff, a_diff, impulse_train)
+        
+        # 共振器处理
+        omega = 2 * np.pi * f / fs
+        r = np.exp(-np.pi * bw / fs)
+        a_coeff = [1, -2*r*np.cos(omega), r**2]
+        y_res = lfilter([1], a_coeff, filtered)
+        
+        y += sign * gains[i] * y_res  # 叠加
+    return y
+
+# 绘制传输函数（标注关键频率点）
+def plot_transfer_function(vowel, fs=Fs):
+    plt.figure(figsize=(10, 8))
+    
+    # --- 计算级联响应（5个共振峰）---
+    w_cas, h_cas = freqz([1], [1], worN=1024, fs=fs)
+    for f, bw in formant_data[vowel]:
+        omega = 2 * np.pi * f / fs
+        r = np.exp(-np.pi * bw / fs)
+        _, h_res = freqz([1], [1, -2*r*np.cos(omega), r**2], worN=1024, fs=fs)
+        h_cas *= h_res
+    
+    # --- 计算并联响应（3个共振峰）---
+    gains = calculate_formant_gains(vowel, fs)
+    w_par, h_par = freqz([0], [1], worN=1024, fs=fs)
+    for i, (f, bw) in enumerate(formant_data[vowel][:3]):
+        if i == 0:  # F1滤波器组合
+            b_pre = [1, -np.exp(-2*np.pi*640/fs)]
+            a_pre = [1, 0]
+            _, h_pre = freqz(b_pre, a_pre, worN=1024, fs=fs)
+            
+            theta = 2 * np.pi * 270 / fs
+            b_ap = [1 - np.tan(theta/2), 1 + np.tan(theta/2)]
+            a_ap = [1 + np.tan(theta/2), 1 - np.tan(theta/2)]
+            _, h_ap = freqz(b_ap, a_ap, worN=1024, fs=fs)
+            
+            h_filter = h_pre * h_ap
+        else:  # F2/F3微分器
+            _, h_filter = freqz([1, -1], [1, 0], worN=1024, fs=fs)
+        
+        omega = 2 * np.pi * f / fs
+        r = np.exp(-np.pi * bw / fs)
+        _, h_res = freqz([gains[i]], [1, -2*r*np.cos(omega), r**2], worN=1024, fs=fs)
+        h_par += ((-1) ** i) * h_filter * h_res
+    
+    # --- 幅度响应图 ---
+    plt.subplot(2, 1, 1)
+    plt.plot(w_cas, 20*np.log10(np.abs(h_cas)), label='Cascade (5 Formants)')
+    plt.plot(w_par, 20*np.log10(np.abs(h_par)), '--', label='Parallel (3 Formants)')
+    
+    # 标注理论共振峰位置（前3个）
+    for i, (f_theory, bw) in enumerate(formant_data[vowel][:3]):
+        plt.axvline(f_theory, color='red', linestyle='--', alpha=0.3)
+        
+        # 检测实际峰值频率（级联）
+        cas_mask = (w_cas > f_theory - 200) & (w_cas < f_theory + 200)
+        cas_peak_idx = np.argmax(np.abs(h_cas[cas_mask]))
+        f_actual_cas = w_cas[cas_mask][cas_peak_idx]
+        dev_cas = (f_actual_cas - f_theory) / f_theory * 100
+        
+        # 检测实际峰值频率（并联）
+        par_mask = (w_par > f_theory - 200) & (w_par < f_theory + 200)
+        par_peak_idx = np.argmax(np.abs(h_par[par_mask]))
+        f_actual_par = w_par[par_mask][par_peak_idx]
+        dev_par = (f_actual_par - f_theory) / f_theory * 100
+        
+        # 添加文本标注
+        plt.text(f_theory, -40, 
+                 f'F{i+1}\nTheory: {f_theory} Hz\n'
+                 f'Cascade: {f_actual_cas:.0f} Hz ({dev_cas:.1f}%)\n'
+                 f'Parallel: {f_actual_par:.0f} Hz ({dev_par:.1f}%)',
+                 ha='center', fontsize=8, color='red', 
+                 bbox=dict(facecolor='white', alpha=0.8))
+    
+    plt.title(f"Amplitude Response: Vowel [{vowel}]")
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Magnitude (dB)')
+    plt.ylim(-60, 80)
+    plt.grid(True)
+    plt.legend()
+    
+    # --- 相位响应图标注 ---
+    plt.subplot(2, 1, 2)
+    plt.plot(w_cas, np.unwrap(np.angle(h_cas)), label='Cascade')
+    plt.plot(w_par, np.unwrap(np.angle(h_par)), '--', label='Parallel')
+    
+    # 初始化数据存储字典
+    analysis_data = {
+        'Formant': [],
+        'Theory_Freq_Hz': [],
+        'Actual_Freq_Cascade_Hz': [],
+        'Deviation_Cascade_%': [],
+        'Actual_Freq_Parallel_Hz': [],
+        'Deviation_Parallel_%': [],
+        'Phase_Cascade_rad': [],
+        'Phase_Parallel_rad': [],
+        'Phase_Difference_rad': []
+    }
+    
+    # 标注每个共振峰（前3个）
+    for i, (f_theory, bw) in enumerate(formant_data[vowel][:3]):
+        # --- 幅度响应数据收集 ---
+        # 级联模型实际频率（同幅度响应计算）
+        cas_mask = (w_cas > f_theory - 200) & (w_cas < f_theory + 200)
+        cas_peak_idx = np.argmax(np.abs(h_cas[cas_mask]))
+        f_actual_cas = w_cas[cas_mask][cas_peak_idx]
+        dev_cas = (f_actual_cas - f_theory) / f_theory * 100
+        
+        # 并联模型实际频率（同幅度响应计算）
+        par_mask = (w_par > f_theory - 200) & (w_par < f_theory + 200)
+        par_peak_idx = np.argmax(np.abs(h_par[par_mask]))
+        f_actual_par = w_par[par_mask][par_peak_idx]
+        dev_par = (f_actual_par - f_theory) / f_theory * 100
+        
+        # --- 相位响应数据收集 ---
+        # 级联相位值（在理论频率处）
+        idx_cas_phase = np.argmin(np.abs(w_cas - f_theory))
+        phase_cas = np.unwrap(np.angle(h_cas))[idx_cas_phase]
+        
+        # 并联相位值（在理论频率处）
+        idx_par_phase = np.argmin(np.abs(w_par - f_theory))
+        phase_par = np.unwrap(np.angle(h_par))[idx_par_phase]
+        phase_diff = phase_par - phase_cas
+        
+        # 存储数据
+        analysis_data['Formant'].append(f'F{i+1}')
+        analysis_data['Theory_Freq_Hz'].append(f_theory)
+        analysis_data['Actual_Freq_Cascade_Hz'].append(f_actual_cas)
+        analysis_data['Deviation_Cascade_%'].append(dev_cas)
+        analysis_data['Actual_Freq_Parallel_Hz'].append(f_actual_par)
+        analysis_data['Deviation_Parallel_%'].append(dev_par)
+        analysis_data['Phase_Cascade_rad'].append(phase_cas)
+        analysis_data['Phase_Parallel_rad'].append(phase_par)
+        analysis_data['Phase_Difference_rad'].append(phase_diff)
+        
+        # --- 相位响应图标注 ---
+        # 标注理论频率处的相位值
+        plt.text(f_theory, phase_cas, 
+                 f'Cascade: {phase_cas:.2f} rad\nParallel: {phase_par:.2f} rad\nΔ: {phase_diff:.2f} rad',
+                 ha='center', fontsize=8, color='purple',
+                 bbox=dict(facecolor='white', alpha=0.8))
+        plt.axvline(f_theory, color='grey', linestyle='--', alpha=0.4)
+    
+    plt.title("Phase Response with Phase Values at Formant Frequencies")
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Phase (radians)')
+    plt.grid(True)
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # --- 打印分析数据（用于Results and Discussion）---
+    print(f"\nAnalysis Data for Vowel [{vowel}]:")
+    for i in range(len(analysis_data['Formant'])):
+        print(f"  {analysis_data['Formant'][i]}:")
+        print(f"    Theory Freq: {analysis_data['Theory_Freq_Hz'][i]} Hz")
+        print(f"    Cascade Freq: {analysis_data['Actual_Freq_Cascade_Hz'][i]:.0f} Hz (Dev: {analysis_data['Deviation_Cascade_%'][i]:.1f}%)")
+        print(f"    Parallel Freq: {analysis_data['Actual_Freq_Parallel_Hz'][i]:.0f} Hz (Dev: {analysis_data['Deviation_Parallel_%'][i]:.1f}%)")
+        print(f"    Phase Cascade: {analysis_data['Phase_Cascade_rad'][i]:.2f} rad")
+        print(f"    Phase Parallel: {analysis_data['Phase_Parallel_rad'][i]:.2f} rad")
+        print(f"    Phase Difference: {analysis_data['Phase_Difference_rad'][i]:.2f} rad\n")
+        
+# 16-bit量化
+def quantize_to_16bit(signal):
+    signal_normalized = signal / np.max(np.abs(signal))
+    return np.int16(signal_normalized * 32767)
+
+# 主程序
+if __name__ == "__main__":
+    vowels = ['a', 'i', 'u']
+    impulse = generate_impulse_train(f0=100)  # 基频100Hz
+    
+    for vowel in vowels:
+        # 合成信号
+        y_cas = cascade_synth(vowel, impulse)
+        y_par = parallel_synth(vowel, impulse)
+        
+        # 保存音频
+        write(f"cascade_{vowel}.wav", Fs, quantize_to_16bit(y_cas))
+        write(f"parallel_{vowel}.wav", Fs, quantize_to_16bit(y_par))
+        
+        # 绘制传输函数
+        plot_transfer_function(vowel)
