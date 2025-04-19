@@ -1,0 +1,103 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import lfilter, freqz, butter, welch
+from scipy.io.wavfile import write
+
+# 采样参数
+Fs = 10000  # 10 kHz采样率
+duration = 0.5  # 持续时间
+
+# Klatt (1980) 男性元音共振峰数据（前5个共振峰）
+formant_data = {
+    'a': [(730, 80), (1090, 90), (2440, 120), (3500, 200), (4950, 300)],
+    'i': [(270, 60), (2290, 90), (3010, 100), (3400, 200), (4950, 300)],
+    'u': [(300, 70), (870, 80), (2240, 100), (3200, 200), (4950, 300)]
+}
+
+# 生成脉冲源（带低通滤波）
+def generate_impulse_train(f0=100, duration=duration, fs=Fs):
+    num_samples = int(duration * fs)
+    impulse_train = np.zeros(num_samples)
+    period = fs // f0
+    impulse_train[::period] = 1  # 脉冲序列
+    
+    # 一阶Butterworth低通滤波器（模拟声门波）
+    b, a = butter(1, f0/(fs/2), btype='low')
+    return lfilter(b, a, impulse_train)
+
+# 微分器传递函数 H_diff(z) = 1 - z^-1
+def differentiator_response(impulse, fs=Fs):
+    b_diff = [1, -1]
+    a_diff = [1, 0]
+    return lfilter(b_diff, a_diff, impulse)
+
+# 分析微分器对高频增强的效果
+def analyze_differentiator_effect(vowel='i', fs=Fs):
+    impulse = generate_impulse_train(f0=100)
+    
+    # 提取并联合成中的微分器路径
+    differentiator_responses = []
+    for i, (f, bw) in enumerate(formant_data[vowel][:3]):
+        if i == 0:  # 跳过F1
+            continue
+            
+        # 纯微分器响应
+        diff_only = differentiator_response(impulse)
+        
+        # 谐振器处理
+        omega = 2 * np.pi * f / fs
+        r = np.exp(-np.pi * bw / fs)
+        a_coeff = [1, -2*r*np.cos(omega), r**2]
+        y_res = lfilter([1], a_coeff, diff_only)
+        
+        differentiator_responses.append(y_res)
+    
+    # 绘制微分器时频响应
+    plt.figure(figsize=(12, 6))
+    
+    # 时域波形
+    plt.subplot(2, 1, 1)
+    plt.plot(differentiator_responses[0][:100], label='F2 Differentiated')
+    plt.plot(differentiator_responses[1][:100], label='F3 Differentiated')
+    plt.title("Differentiator Time-domain Response")
+    plt.xlabel('Samples')
+    plt.ylabel('Amplitude')
+    plt.legend()
+    
+    # 频域响应
+    plt.subplot(2, 1, 2)
+    for i, resp in enumerate(differentiator_responses):
+        f, Pxx = welch(resp, fs=fs, nperseg=1024)
+        plt.semilogx(f, 10*np.log10(Pxx), label=f'F{i+2}')
+    
+    plt.title("Differentiator Frequency Response")
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Power (dB)')
+    plt.xlim(50, fs/2)
+    plt.grid(True)
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 打印高频增强数据
+    print("\nHigh-frequency Enhancement Analysis:")
+    for i, resp in enumerate(differentiator_responses):
+        # 计算1kHz以上能量占比
+        _, Pxx = welch(resp, fs=fs, nperseg=1024)
+        f = np.linspace(0, fs/2, len(Pxx))
+        hf_energy = np.sum(Pxx[f > 1000])
+        total_energy = np.sum(Pxx)
+        print(f"F{i+2} ({formant_data[vowel][i+1][0]}Hz):")
+        print(f"  >1kHz Energy Ratio: {hf_energy/total_energy:.1%}")
+        print(f"  Peak Frequency: {f[np.argmax(Pxx)]:.0f}Hz")
+    
+    # 检查高频滚降速率
+    print("\nHigh Frequency Roll-off Analysis (around 5kHz):")
+    for i, resp in enumerate(differentiator_responses):
+        f, Pxx = welch(resp, fs=fs, nperseg=1024)
+        rolloff = np.polyfit(np.log(f[100:]), np.log(Pxx[100:]), 1)
+        print(f"F{i+2} Roll-off Slope: {rolloff[0]:.2f} dB/octave")
+
+# 调用示例
+analyze_differentiator_effect(vowel='i')
